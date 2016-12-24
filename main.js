@@ -1,6 +1,9 @@
 'use strict';
 
-import React, { Component } from 'react';
+import React, {
+  Component
+} from 'react';
+
 import {
   AppRegistry,
   StyleSheet,
@@ -11,211 +14,179 @@ import {
   ListView,
 } from 'react-native';
 
-console.log("\n\n\nhello\n\n\n");
-
-// import io from 'socket.io-client/socket.io';
-// import io from 'socket.io-client/socket.io';
-import io from 'socket.io-client';
-
-const socket = io.connect('https://react-native-webrtc.herokuapp.com', {transports: ['websocket']});
-
 import {
-  RTCPeerConnection,
-  RTCMediaStream,
-  RTCIceCandidate,
-  RTCSessionDescription,
   RTCView,
-  MediaStreamTrack,
   getUserMedia,
 } from 'react-native-webrtc';
 
-const configuration = {"iceServers": [{"url": "stun:stun.l.google.com:19302"}]};
+import {
+  init as SigChannelInit
+} from './pluot/FirebaseSigCaller';
 
-const pcPeers = {};
-let localStream;
+import {
+  constructRTCPeersManager
+} from './pluot/PeerConnectionWrapper';
 
-function getLocalStream(isFront, callback) {
-  MediaStreamTrack.getSources(sourceInfos => {
-    console.log(sourceInfos);
-    let videoSourceId;
-    for (const i = 0; i < sourceInfos.length; i++) {
-      const sourceInfo = sourceInfos[i];
-      if(sourceInfo.kind == "video" && sourceInfo.facing == (isFront ? "front" : "back")) {
-        videoSourceId = sourceInfo.id;
+// constants
+const CONN_ESTABLISH_TIMEOUT = 20000;  // twenty seconds
+const device_type = "browser";
+
+// instance for top-level React container
+let pluot;
+
+const dispatcher = {
+  msgSigChannel: function (m) {
+    switch (m.tag) {
+    case 'available for call':   return rtcpeers.msgPeerAvailableForCall (m);
+    case 'please call':          return rtcpeers.msgPeerPleaseCall (m);
+    case 'please renegotiate':   return rtcpeers.msgPeerPleaseRenegotiate (m);
+    case 'sdp offer':            return rtcpeers.msgPeerSDPOffer (m);
+    case 'sdp answer':           return rtcpeers.msgPeerSDPAnswer (m);
+    case 'ice candidate':        return rtcpeers.msgPeerICECandidate (m);
+    }
+    
+    console.log("fall-through sig channel message", { sig_msg: m });
+
+    return null;
+  },
+
+  evtFirebaseDisconnect: function () {
+    if (! we_are_post_shutdown) {
+      fatalError('network unreachable');
+    } else {
+      console.log('fb disconnect');
+    }
+  },
+  
+  evtFirebaseReconnect:  function () {
+    console.log('fb reconnect')
+  },
+
+  evtPeerInfo: function () {
+    rtcpeers.evtPeerInfo.apply (null, arguments)
+  },
+
+  evtNewRTCPeer: handle_new_rtc_peer,
+  evtNewCamStream: handle_new_cam_stream,
+  evtNewScreenStream: handle_new_screen_stream,
+  evtScreenStreamStop: handle_stop_screen_stream,
+  evtRTCPeerDisconnect: handle_rtc_peer_disconnect,
+  evtTwilioDialOutHangup: function (child_data, dial_outs_data) {
+    if (dial_outs_data === null) {
+      switchOutOfAudioConf ();
+    }
+  },
+  
+  evtTwilioDialOutJoin: function (child_data, dial_outs_data) {
+    if (Object.keys (dial_outs_data).length === 1) {
+      // fix: sanity check that call machine's meeting string matches the
+      // dial_outs_data meeting string
+      switchToAudioConf (Util.readGlobal ('mtg_str'));
+    }
+  },
+
+  callbackSetVideoCap: function (rtcSDP, peer_device_type, peer_network_type) {
+    let low_bcap = 768;
+    let high_bcap = 1280;
+    let peers_count = fullPeersCount()-1;
+    let bcap = 0;
+    if (peers_count < 1) {
+      console.log('very strange peers count error in callbackSetVideoCap');
+      return rtcSDP;
+    }
+    if (window && window.bandwidthCap) {
+      bcap = window.bandwidthCap;
+    } else {
+      console.log('bandwidth send calculations ...',
+                  peers_count, peer_device_type, peer_network_type);
+      // a starting value -- high for boxes on ethernet, lower otherwise
+      if ((device_type === 'box') &&
+          (network_type === 'high') &&
+          (peer_device_type === 'box') &&
+          (peer_network_type === 'high')) {
+        bcap = high_bcap / peers_count;
+      } else {
+        bcap = low_bcap / peers_count;
       }
+      console.log ('    b=AS:', bcap);
     }
-    getUserMedia({
-      audio: true,
-      video: {
-        mandatory: {
-          minWidth: 500, // Provide your own width, height and frame rate here
-          minHeight: 300,
-          minFrameRate: 30
-        },
-        facingMode: (isFront ? "user" : "environment"),
-        optional: [{ sourceId: sourceInfos.id }]
-      }
-    }, function (stream) {
-      console.log('dddd', stream);
-      callback(stream);
-    }, logError);
-  });
+
+    rtcSDP.sdp = rtcSDP.sdp.replace(/a=mid:video\r\nb=AS:\d+\r\n/g,
+                                    'a=mid:video\r\n');
+    rtcSDP.sdp = rtcSDP.sdp.replace(/a=mid:video\r\n/g,
+                                    `a=mid:video\r\nb=AS:${bcap}\r\n`);
+    return rtcSDP;
+  }
+};
+
+function handle_new_rtc_peer (peer_id, cam_stream, screen_stream, participation_type, resolve, reject) {
+  activePeers[peer_id] = {
+    peer_id, cam_stream
+  }
+  
+  if (cam_stream) {
+    pluot.setState({peers: activePeers})
+  }
 }
 
-function join(roomID) {
-  socket.emit('join', roomID, function(socketIds){
-    console.log('join', socketIds);
-    for (const i in socketIds) {
-      const socketId = socketIds[i];
-      createPC(socketId, true);
-    }
-  });
+function handle_rtc_peer_disconnect (peer_id) {}
+
+function handle_new_cam_stream (peer_id, stream, delay_layout) {
+  if (stream) {
+    activePeers[peer_id]["cam_stream"] = stream
+    pluot.setState({peers: activePeers})
+  }
 }
 
-function createPC(socketId, isOffer) {
-  const pc = new RTCPeerConnection(configuration);
-  pcPeers[socketId] = pc;
+function handle_new_screen_stream (peer_id, stream, delay_layout) {}
+function handle_stop_screen_stream (peer_id, cam_stream) {}
 
-  pc.onicecandidate = function (event) {
-    console.log('onicecandidate', event.candidate);
-    if (event.candidate) {
-      socket.emit('exchange', {'to': socketId, 'candidate': event.candidate });
-    }
-  };
+// signaling channel
+let signalingChannel = SigChannelInit("ios-test", dispatcher);
 
-  function createOffer() {
-    pc.createOffer(function(desc) {
-      console.log('createOffer', desc);
-      pc.setLocalDescription(desc, function () {
-        console.log('setLocalDescription', pc.localDescription);
-        socket.emit('exchange', {'to': socketId, 'sdp': pc.localDescription });
-      }, logError);
-    }, logError);
-  }
+// peers manager
+let rtcpeers = constructRTCPeersManager();
+rtcpeers.setDispatcher(dispatcher);
 
-  pc.onnegotiationneeded = function () {
-    console.log('onnegotiationneeded');
-    if (isOffer) {
-      createOffer();
-    }
-  }
+let activePeers = {}
 
-  pc.oniceconnectionstatechange = function(event) {
-    console.log('oniceconnectionstatechange', event.target.iceConnectionState);
-    if (event.target.iceConnectionState === 'completed') {
-      setTimeout(() => {
-        getStats();
-      }, 1000);
-    }
-    if (event.target.iceConnectionState === 'connected') {
-      createDataChannel();
-    }
-  };
-  pc.onsignalingstatechange = function(event) {
-    console.log('onsignalingstatechange', event.target.signalingState);
-  };
+let localCamStream = null;
 
-  pc.onaddstream = function (event) {
-    console.log('onaddstream', event.stream);
-    container.setState({info: 'One peer join!'});
 
-    const remoteList = container.state.remoteList;
-    remoteList[socketId] = event.stream.toURL();
-    container.setState({ remoteList: remoteList });
-  };
-  pc.onremovestream = function (event) {
-    console.log('onremovestream', event.stream);
-  };
-
-  pc.addStream(localStream);
-  function createDataChannel() {
-    if (pc.textDataChannel) {
-      return;
-    }
-    const dataChannel = pc.createDataChannel("text");
-
-    dataChannel.onerror = function (error) {
-      console.log("dataChannel.onerror", error);
+// React native component class
+const PluotDemo = React.createClass({
+  getInitialState: function() {
+    return {
+      info: 'Initializing',
+      selfViewSrc: null,
+      peers: {},
     };
+  },
 
-    dataChannel.onmessage = function (event) {
-      console.log("dataChannel.onmessage:", event.data);
-      container.receiveTextData({user: socketId, message: event.data});
-    };
+  componentDidMount: function() {
+    pluot = this;
+  },
 
-    dataChannel.onopen = function () {
-      console.log('dataChannel.onopen');
-      container.setState({textRoomConnected: true});
-    };
+  render() {
+    return (
+      <View style={styles.container}>
+        <Text style={styles.welcome}>
+          {"Pluot Demo\n"}
+          {this.state.info}
+        </Text>
 
-    dataChannel.onclose = function () {
-      console.log("dataChannel.onclose");
-    };
-
-    pc.textDataChannel = dataChannel;
-  }
-  return pc;
-}
-
-function exchange(data) {
-  const fromId = data.from;
-  let pc;
-  if (fromId in pcPeers) {
-    pc = pcPeers[fromId];
-  } else {
-    pc = createPC(fromId, false);
-  }
-
-  if (data.sdp) {
-    console.log('exchange sdp', data);
-    pc.setRemoteDescription(new RTCSessionDescription(data.sdp), function () {
-      if (pc.remoteDescription.type == "offer")
-        pc.createAnswer(function(desc) {
-          console.log('createAnswer', desc);
-          pc.setLocalDescription(desc, function () {
-            console.log('setLocalDescription', pc.localDescription);
-            socket.emit('exchange', {'to': fromId, 'sdp': pc.localDescription });
-          }, logError);
-        }, logError);
-    }, logError);
-  } else {
-    console.log('exchange candidate', data);
-    pc.addIceCandidate(new RTCIceCandidate(data.candidate));
-  }
-}
-
-function leave(socketId) {
-  console.log('leave', socketId);
-  const pc = pcPeers[socketId];
-  const viewIndex = pc.viewIndex;
-  pc.close();
-  delete pcPeers[socketId];
-
-  const remoteList = container.state.remoteList;
-  delete remoteList[socketId]
-  container.setState({ remoteList: remoteList });
-  container.setState({info: 'One peer leave!'});
-}
-
-socket.on('exchange', function(data){
-  exchange(data);
-});
-socket.on('leave', function(socketId){
-  leave(socketId);
-});
-
-socket.on('connect', function(data) {
-  console.log('connect');
-  getLocalStream(true, function(stream) {
-    localStream = stream;
-    container.setState({selfViewSrc: stream.toURL()});
-    container.setState({status: 'ready', info: 'Please enter or create room ID'});
-  });
-});
-
-function logError(error) {
-  console.log("logError", error);
-}
+        <RTCView streamURL={this.state.selfViewSrc} style={styles.streamView}/>
+        {
+          mapHash(this.state.peers, function(remote, index) {
+            if (remote && remote.cam_stream) {
+              return <RTCView key={index} streamURL={remote.cam_stream.toURL()} style={styles.streamView}/>
+            }
+          })
+        }
+      </View>
+    )
+  },
+})
 
 function mapHash(hash, func) {
   const array = [];
@@ -226,150 +197,134 @@ function mapHash(hash, func) {
   return array;
 }
 
-function getStats() {
-  const pc = pcPeers[Object.keys(pcPeers)[0]];
-  if (pc.getRemoteStreams()[0] && pc.getRemoteStreams()[0].getAudioTracks()[0]) {
-    const track = pc.getRemoteStreams()[0].getAudioTracks()[0];
-    console.log('track', track);
-    pc.getStats(track, function(report) {
-      console.log('getStats report', report);
-    }, logError);
+function joinMeeting() {
+  rtcpeers.setAcceptCalls(true, {
+    sig_channel: signalingChannel,
+    participation_type: "full",
+    device_type: "browser",
+    network_type: "low"
+  })
+
+  const promises = prior_active_peers().map (function (p) {
+    return rtcpeers.initiateCall (p._id, p.participation_type);
+  });
+  
+  return Promise.race
+    ([Promise.all (promises), timeoutRejPromise ('timeout', CONN_ESTABLISH_TIMEOUT)])
+
+}
+
+function timeoutRejPromise (pass_through_value, timeout) {
+  return new Promise (function (resolve, reject) {
+    setTimeout (function () { reject (pass_through_value) }, timeout);
+  });
+}
+
+// do everything
+
+function run() {
+  getLocalStream()
+  .then(function(stream) {
+    localCamStream = stream;
+
+    pluot.setState({selfViewSrc: stream.toURL()});
+  })
+  .then(function() {
+    pluot.setState({info: "local stream live"})
+  })
+  .then(signalingChannel.connect)
+  .then(function() {
+    pluot.setState({info: `connected to signaling channel: ${signalingChannel.sessionId()}`})
+  })
+  .then(function() {
+    var initial_presence_ref =  {
+          join_mtg_ts:        signalingChannel.SERVER_TIMESTAMP,
+          app_state:          'present',
+          device_type:        'browser',
+          layout_style:       'browser',
+          participation_type: 'full',
+          meeting_name:       'AAAAAAAAAAAA'
+        }
+    return signalingChannel.joinMtg('AAAAAAAAAAAA', initial_presence_ref)
+  })
+  .then(joinMeeting)
+  .then(function() {
+    rtcpeers.setCamStream(localCamStream, signalingChannel);
+  })
+  .then(function() {
+    pluot.setState({info: "joined meeting"})
+  })
+  .catch(function(error) {
+    pluot.setState({info: error.message})
+  })
+}
+
+// ----- info and connection management utilities -----
+
+function prior_active_peers () {
+  return prior_peers
+    (signalingChannel.connectedPeersList().slice().filter(function (p) {
+        return p.join_mtg_ts;
+    }));
+}
+
+// the slice of a peers list that precedes our entry. if no list is
+// passed in, we use the current connectedPeersList()
+function prior_peers (list) {
+  if (! signalingChannel) {
+    return [];
+  }
+  if (! list) {
+    list = signalingChannel.connectedPeersList();
+  }
+  for (var i=0; i < list.length; i++) {
+    if (list[i]._id === signalingChannel.sessionId())
+      break;
+  }
+  return list.slice(0, i);
+}
+
+function fullPeersCount () {
+  return signalingChannel.connectedPeersList().filter(function (p) {
+    return is_full_peer(p);
+  }).length;
+}
+
+// test whether a peer is a "full" peer, meaning it intends to be a
+// full-duplex meeting participant. (not just, say, a screen sharer).
+function is_full_peer (p) {
+  if (p.participation_type) {
+    return (p.participation_type === 'full');
+  } else {
+    return signalingChannel.connectedPeersHash[p].participation_type;
   }
 }
 
-let container;
+// connect to video camera
 
-const RCTWebRTCDemo = React.createClass({
-  getInitialState: function() {
-    this.ds = new ListView.DataSource({rowHasChanged: (r1, r2) => true});
-    return {
-      info: 'Initializing',
-      status: 'init',
-      roomID: '',
-      isFront: true,
-      selfViewSrc: null,
-      remoteList: {},
-      textRoomConnected: false,
-      textRoomData: [],
-      textRoomValue: '',
-    };
-  },
-  componentDidMount: function() {
-    container = this;
-  },
-  _press(event) {
-    this.refs.roomID.blur();
-    this.setState({status: 'connect', info: 'Connecting'});
-    join(this.state.roomID);
-  },
-  _switchVideoType() {
-    const isFront = !this.state.isFront;
-    this.setState({isFront});
-    getLocalStream(isFront, function(stream) {
-      if (localStream) {
-        for (const id in pcPeers) {
-          const pc = pcPeers[id];
-          pc && pc.removeStream(localStream);
-        }
-        localStream.release();
+function getLocalStream() {
+  return new Promise(function(resolve, reject) {
+    getUserMedia({
+      audio: true,
+      video: {
+        mandatory: {
+          minWidth: 500,
+          minHeight: 300,
+          minFrameRate: 30
+        },
+        facingMode: "user",
       }
-      localStream = stream;
-      container.setState({selfViewSrc: stream.toURL()});
+    }, function(stream) {
+      resolve(stream)
+    }, function(error) {
+      reject(error)
+    })
+  })
+}
 
-      for (const id in pcPeers) {
-        const pc = pcPeers[id];
-        pc && pc.addStream(localStream);
-      }
-    });
-  },
-  receiveTextData(data) {
-    const textRoomData = this.state.textRoomData.slice();
-    textRoomData.push(data);
-    this.setState({textRoomData, textRoomValue: ''});
-  },
-  _textRoomPress() {
-    if (!this.state.textRoomValue) {
-      return
-    }
-    const textRoomData = this.state.textRoomData.slice();
-    textRoomData.push({user: 'Me', message: this.state.textRoomValue});
-    for (const key in pcPeers) {
-      const pc = pcPeers[key];
-      pc.textDataChannel.send(this.state.textRoomValue);
-    }
-    this.setState({textRoomData, textRoomValue: ''});
-  },
-  _renderTextRoom() {
-    return (
-      <View style={styles.listViewContainer}>
-        <ListView
-          dataSource={this.ds.cloneWithRows(this.state.textRoomData)}
-          renderRow={rowData => <Text>{`${rowData.user}: ${rowData.message}`}</Text>}
-          />
-        <TextInput
-          style={{width: 200, height: 30, borderColor: 'gray', borderWidth: 1}}
-          onChangeText={value => this.setState({textRoomValue: value})}
-          value={this.state.textRoomValue}
-        />
-        <TouchableHighlight
-          onPress={this._textRoomPress}>
-          <Text>Send</Text>
-        </TouchableHighlight>
-      </View>
-    );
-  },
-  render() {
-    return (
-      <View style={styles.container}>
-        <Text style={styles.welcome}>
-          {this.state.info}
-        </Text>
-        {this.state.textRoomConnected && this._renderTextRoom()}
-        <View style={{flexDirection: 'row'}}>
-          <Text>
-            {this.state.isFront ? "Use front camera" : "Use back camera"}
-          </Text>
-          <TouchableHighlight
-            style={{borderWidth: 1, borderColor: 'black'}}
-            onPress={this._switchVideoType}>
-            <Text>Switch camera</Text>
-          </TouchableHighlight>
-        </View>
-        { this.state.status == 'ready' ?
-          (<View>
-            <TextInput
-              ref='roomID'
-              autoCorrect={false}
-              style={{width: 200, height: 40, borderColor: 'gray', borderWidth: 1}}
-              onChangeText={(text) => this.setState({roomID: text})}
-              value={this.state.roomID}
-            />
-            <TouchableHighlight
-              onPress={this._press}>
-              <Text>Enter room</Text>
-            </TouchableHighlight>
-          </View>) : null
-        }
-        <RTCView streamURL={this.state.selfViewSrc} style={styles.selfView}/>
-        {
-          mapHash(this.state.remoteList, function(remote, index) {
-            return <RTCView key={index} streamURL={remote} style={styles.remoteView}/>
-          })
-        }
-      </View>
-    );
-  }
-});
+window.setTimeout(() => {run()}, 1000)
 
 const styles = StyleSheet.create({
-  selfView: {
-    width: 200,
-    height: 150,
-  },
-  remoteView: {
-    width: 200,
-    height: 150,
-  },
   container: {
     flex: 1,
     justifyContent: 'center',
@@ -380,9 +335,14 @@ const styles = StyleSheet.create({
     textAlign: 'center',
     margin: 10,
   },
-  listViewContainer: {
+
+  streamView: {
+    width: 200,
     height: 150,
+    justifyContent: 'center',
+    backgroundColor: 'black',
   },
+  
 });
 
-AppRegistry.registerComponent('RCTWebRTCDemo', () => RCTWebRTCDemo);
+AppRegistry.registerComponent('PluotDemo', () => PluotDemo);
