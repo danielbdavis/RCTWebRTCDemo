@@ -618,7 +618,7 @@ function constructRTCPeersManager () {
 
 function get_peer_conn_setup () {
   var v = {};
-  // v.config = {"iceServers":[{"urls":"stun:stun.l.google.com:19302"}]};
+  v.config = {"iceServers":[{"urls":"stun:stun.l.google.com:19302"}]};
   v.constraints = {
     "optional": [  {   "googCpuOveruseDetection": true  } ]
   };

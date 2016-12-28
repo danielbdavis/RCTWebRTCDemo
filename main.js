@@ -129,7 +129,11 @@ function handle_new_rtc_peer (peer_id, cam_stream, screen_stream, participation_
   }
 }
 
-function handle_rtc_peer_disconnect (peer_id) {}
+function handle_rtc_peer_disconnect (peer_id) {
+  delete activePeers[peer_id]
+
+  pluot.setState({peers: activePeers})
+}
 
 function handle_new_cam_stream (peer_id, stream, delay_layout) {
   if (stream) {
@@ -142,7 +146,7 @@ function handle_new_screen_stream (peer_id, stream, delay_layout) {}
 function handle_stop_screen_stream (peer_id, cam_stream) {}
 
 // signaling channel
-let signalingChannel = SigChannelInit("ios-test", dispatcher);
+let signalingChannel = SigChannelInit("ios-test" + Date.now(), dispatcher);
 
 // peers manager
 let rtcpeers = constructRTCPeersManager();
